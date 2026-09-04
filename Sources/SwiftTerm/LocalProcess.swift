@@ -175,11 +175,11 @@ public class LocalProcess {
 
     /* Total number of bytes read */
     var totalRead = 0
-    func childProcessRead (done: Bool, data: DispatchData?, errno: Int32) {
+    func childProcessRead (generation: Int, done: Bool, data: DispatchData?, errno: Int32) {
         guard let data else {
             // Re-schedule the read on transient errors to keep the chain alive
             if !done, running {
-                io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+                armRead(generation: generation)
             }
             return
         }
@@ -189,10 +189,14 @@ public class LocalProcess {
         }
         
         if data.count == 0 {
-            childfd = -1
-            if running {
-                childStopped()
-                // delegate.processTerminated (self, exitCode: nil)
+            // Settle on the same serial queue as the process-exit source, and
+            // only for the child this read belonged to (see spawnGeneration).
+            dispatchQueue.async { [weak self] in
+                guard let self, generation == self.spawnGeneration else { return }
+                self.childfd = -1
+                if self.running {
+                    self.childStopped()
+                }
             }
             return
         }
@@ -214,15 +218,16 @@ public class LocalProcess {
         dispatchQueue.sync {
             delegate?.dataReceived(slice: b[...])
         }
-        io?.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+        armRead(generation: generation)
     }
 
 #if os(macOS)
     var childMonitor: DispatchSourceProcess?
 #endif
 
-    func processTerminated ()
+    func processTerminated (generation: Int)
     {
+        guard generation == spawnGeneration else { return }
         var n: Int32 = 0
         waitpid (shellPid, &n, WNOHANG)
         delegate?.processTerminated(self, exitCode: n)
@@ -231,6 +236,23 @@ public class LocalProcess {
 
     /// Indicates if the child process is currently running
     public private(set) var running: Bool = false
+    /// Rodney backport (MITSS-ai/SwiftTerm, branch rodney/1.11.2-termination-race).
+    ///
+    /// Upstream 1.11.2 ends a child on two paths: the PTY-EOF read on
+    /// `readQueue` and the process-exit source on `dispatchQueue`. Both call
+    /// `childStopped()`, which releases `childMonitor` and clears `running`
+    /// unsynchronized, so a child exit can double-release the monitor and trap
+    /// (libdispatch "API MISUSE: Over-release of an object"). Upstream fixed
+    /// this on `main` with the 2026-08-29 lifecycle rewrite (issue #370); this
+    /// is the minimal equivalent for 1.11.2: the EOF path settles on
+    /// `dispatchQueue` too, and every spawn carries a generation so a late
+    /// event from a previous child cannot act on the current one.
+    private var spawnGeneration = 0
+    private func armRead(generation: Int) {
+        io?.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
+            self?.childProcessRead(generation: generation, done: done, data: data, errno: errno)
+        }
+    }
     
     /**
      * Launches a child process inside a pseudo-terminal
@@ -262,6 +284,8 @@ public class LocalProcess {
             self.masterFd = master
             self.slaveFd = slave
             self.childfd = master
+            spawnGeneration &+= 1
+            let generation = spawnGeneration
             
             // Set window size on the master fd
             _ = PseudoTerminalHelpers.setWinSize(masterPtyDescriptor: master, windowSize: &size)
@@ -295,7 +319,7 @@ public class LocalProcess {
             }
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
-            io.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+            armRead(generation: generation)
             
             // Start subprocess with swift-subprocess asynchronously
             Task {
@@ -368,6 +392,8 @@ public class LocalProcess {
         }
 
         if let (shellPid, childfd) = PseudoTerminalHelpers.fork(andExec: executable, args: shellArgs, env: env, currentDirectory: currentDirectory, desiredWindowSize: &size) {
+            spawnGeneration &+= 1
+            let generation = spawnGeneration
 #if os(macOS)
             childMonitor = DispatchSource.makeProcessSource(identifier: shellPid, eventMask: .exit, queue: dispatchQueue)
             if let cm = childMonitor {
@@ -376,7 +402,7 @@ public class LocalProcess {
                 } else {
                     // Fallback on earlier versions
                 }
-                cm.setEventHandler(handler: { [weak self] in self?.processTerminated () })
+                cm.setEventHandler(handler: { [weak self] in self?.processTerminated (generation: generation) })
             }
 #endif
             running = true
@@ -394,7 +420,7 @@ public class LocalProcess {
             }
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
-            io.read(offset: 0, length: readSize, queue: readQueue, ioHandler: childProcessRead)
+            armRead(generation: generation)
         }
     }
 
