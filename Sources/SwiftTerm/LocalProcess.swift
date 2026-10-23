@@ -175,11 +175,11 @@ public class LocalProcess {
 
     /* Total number of bytes read */
     var totalRead = 0
-    func childProcessRead (generation: Int, done: Bool, data: DispatchData?, errno: Int32) {
+    func childProcessRead (channel: DispatchIO, generation: Int, done: Bool, data: DispatchData?, errno: Int32) {
         guard let data else {
             // Re-schedule the read on transient errors to keep the chain alive
             if !done, running {
-                armRead(generation: generation)
+                armRead(channel: channel, generation: generation)
             }
             return
         }
@@ -218,7 +218,7 @@ public class LocalProcess {
         dispatchQueue.sync {
             delegate?.dataReceived(slice: b[...])
         }
-        armRead(generation: generation)
+        armRead(channel: channel, generation: generation)
     }
 
 #if os(macOS)
@@ -248,9 +248,26 @@ public class LocalProcess {
     /// `dispatchQueue` too, and every spawn carries a generation so a late
     /// event from a previous child cannot act on the current one.
     private var spawnGeneration = 0
-    private func armRead(generation: Int) {
-        io?.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
-            self?.childProcessRead(generation: generation, done: done, data: data, errno: errno)
+
+    /// Rodney backport, second race (MITSS-ai/rodney#4788).
+    ///
+    /// The read chain re-arms on the channel it was STARTED on, which the
+    /// read handler captures, and never on `self.io`. Upstream 1.11.2 re-arms
+    /// through `self.io` from `readQueue` after every delivery, while
+    /// `terminate()` (and a respawn in `startProcess`) assigns `self.io` on
+    /// the caller's queue. That is an unsynchronized load/store of a
+    /// reference: when the store drops the channel's last external reference
+    /// between the reader's load and its retain, libdispatch traps ("API
+    /// MISUSE: Resurrection of an object", SIGTRAP in `LocalProcess.io.getter`).
+    ///
+    /// Owning the channel closes that window without a lock, because nothing
+    /// off the caller's queue reads `io` any more. After `terminate()` the
+    /// chain's next read lands on a closed channel, which answers ECANCELED
+    /// with `done` and ends the chain; after a respawn the previous chain
+    /// drains its own channel to EOF and is ignored by generation.
+    private func armRead(channel: DispatchIO, generation: Int) {
+        channel.read(offset: 0, length: readSize, queue: readQueue) { [weak self] done, data, errno in
+            self?.childProcessRead(channel: channel, generation: generation, done: done, data: data, errno: errno)
         }
     }
     
@@ -319,7 +336,7 @@ public class LocalProcess {
             }
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
-            armRead(generation: generation)
+            armRead(channel: io, generation: generation)
             
             // Start subprocess with swift-subprocess asynchronously
             Task {
@@ -420,7 +437,7 @@ public class LocalProcess {
             }
             io.setLimit(lowWater: 1)
             io.setLimit(highWater: readSize)
-            armRead(generation: generation)
+            armRead(channel: io, generation: generation)
         }
     }
 
